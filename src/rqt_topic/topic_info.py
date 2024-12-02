@@ -36,9 +36,11 @@
 # from io import StringIO
 
 from python_qt_binding.QtCore import qWarning
+from rclpy.qos import QoSPolicyKind
+from rclpy.qos_overriding_options import QosCallbackResult, QoSOverridingOptions
 from ros2topic.verb.hz import ROSTopicHz
 from rqt_py_common.message_helpers import get_message_class
-from rclpy.qos_overriding_options import QoSOverridingOptions, QosCallbackResult
+
 
 class TopicInfo(ROSTopicHz):
 
@@ -78,12 +80,17 @@ class TopicInfo(ROSTopicHz):
     def start_monitoring(self):
         if self.message_class is not None:
             self.monitoring = True
+            qos_options = QoSOverridingOptions(
+                policy_kinds=(
+                    QoSPolicyKind.HISTORY,
+                    QoSPolicyKind.DEPTH,
+                    QoSPolicyKind.RELIABILITY,
+                    QoSPolicyKind.DURABILITY),
+                callback=self.qos_callback)
             self._subscriber = self._node.create_subscription(
                 self.message_class, self._topic_name, self.message_callback,
                 qos_profile=10,
-                qos_overriding_options=QoSOverridingOptions.with_default_policies(
-                    callback=self.qos_callback,
-                ))
+                qos_overriding_options=qos_options)
 
     def qos_callback(self, qos):
         result = QosCallbackResult()
