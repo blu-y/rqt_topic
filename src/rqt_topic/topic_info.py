@@ -36,18 +36,18 @@
 # from io import StringIO
 
 from python_qt_binding.QtCore import qWarning
-from rclpy.qos import QoSPolicyKind
-from rclpy.qos_overriding_options import QosCallbackResult, QoSOverridingOptions
+from rclpy.qos import qos_profile_system_default
 from ros2topic.verb.hz import ROSTopicHz
 from rqt_py_common.message_helpers import get_message_class
 
 
 class TopicInfo(ROSTopicHz):
 
-    def __init__(self, node, topic_name, topic_type):
+    def __init__(self, node, topic_name, topic_type, qos_profile=qos_profile_system_default):
         super(TopicInfo, self).__init__(node, 100)
         self._node = node
         self._topic_name = topic_name
+        self._qos_profile = qos_profile
         self.error = None
         self._subscriber = None
         self.monitoring = False
@@ -79,23 +79,19 @@ class TopicInfo(ROSTopicHz):
 
     def start_monitoring(self):
         if self.message_class is not None:
-            self.monitoring = True
-            qos_options = QoSOverridingOptions(
-                policy_kinds=(
-                    QoSPolicyKind.HISTORY,
-                    QoSPolicyKind.DEPTH,
-                    QoSPolicyKind.RELIABILITY,
-                    QoSPolicyKind.DURABILITY),
-                callback=self.qos_callback)
+            if self._subscriber is not None:
+                self.stop_monitoring()
             self._subscriber = self._node.create_subscription(
                 self.message_class, self._topic_name, self.message_callback,
-                qos_profile=10,
-                qos_overriding_options=qos_options)
+                qos_profile=self._qos_profile)
+            self.monitoring = True
 
-    def qos_callback(self, qos):
-        result = QosCallbackResult()
-        result.successful = True
-        return result
+    def set_qos_profile(self, qos_profile):
+        was_monitoring = self.monitoring
+        self._qos_profile = qos_profile
+        if was_monitoring:
+            self.stop_monitoring()
+            self.start_monitoring()
 
     def stop_monitoring(self):
         self.monitoring = False

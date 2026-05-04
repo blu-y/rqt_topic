@@ -36,7 +36,9 @@ from ament_index_python import get_resource
 from python_qt_binding import loadUi
 from python_qt_binding.QtCore import Qt, QTimer, qWarning, Slot
 from python_qt_binding.QtGui import QIcon
-from python_qt_binding.QtWidgets import QHeaderView, QMenu, QTreeWidgetItem, QWidget
+from python_qt_binding.QtWidgets import (
+    QComboBox, QHeaderView, QMenu, QSpinBox, QTreeWidgetItem, QWidget)
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rqt_py_common.message_helpers import get_message_class
 
 from .topic_info import TopicInfo
@@ -56,7 +58,11 @@ class TopicWidget(QWidget):
 
     DEFAULT_TOPIC_TIMEOUT_SECONDS = 10.0
 
-    _column_names = ['topic', 'type', 'bandwidth', 'rate', 'value', '_msg_order']
+    _column_names = [
+        'topic', 'type', 'bandwidth', 'rate', 'value',
+        'reliability', 'history', 'durability', 'depth',
+        '_msg_order',
+    ]
 
     def __init__(self, node, plugin=None, selected_topics=None,
                  select_topic_type=SELECT_BY_NAME, topic_timeout=DEFAULT_TOPIC_TIMEOUT_SECONDS):
@@ -82,17 +88,6 @@ class TopicWidget(QWidget):
         ui_file = os.path.join(package_path, 'share', 'rqt_topic', 'resource', 'TopicWidget.ui')
         loadUi(ui_file, self)
         self._plugin = plugin
-        self.topics_tree_widget.sortByColumn(
-            self._column_names.index('_msg_order'), Qt.AscendingOrder)
-        header = self.topics_tree_widget.header()
-        try:
-            setSectionResizeMode = header.setSectionResizeMode  # Qt5
-        except AttributeError:
-            setSectionResizeMode = header.setResizeMode  # Qt4
-        setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.customContextMenuRequested.connect(
-            self.handle_header_view_customContextMenuRequested)
-        header.setContextMenuPolicy(Qt.CustomContextMenu)
 
         # Whether to get all topics or only the topics that are set in advance.
         # Can be also set by the setter method "set_selected_topics".
@@ -103,11 +98,44 @@ class TopicWidget(QWidget):
         self._column_index = {}
         for column_name in self._column_names:
             self._column_index[column_name] = len(self._column_index)
-        self.topics_tree_widget.setColumnHidden(self._column_index['_msg_order'], True)
+
+        self._init_tree_columns()
 
         # init and start update timer
         self._timer_refresh_topics = QTimer(self)
         self._timer_refresh_topics.timeout.connect(self.refresh_topics)
+
+    def _init_tree_columns(self):
+        # Explicitly configure tree columns to avoid stale .ui file issues
+        self.topics_tree_widget.setColumnCount(len(self._column_names))
+        header_labels = [
+            'Topic', 'Type', 'Bandwidth', 'Hz', 'Value',
+            'Reliability', 'History', 'Durability', 'Depth',
+            'MsgOrder',
+        ]
+        for i, label in enumerate(header_labels):
+            self.topics_tree_widget.headerItem().setText(i, label)
+        self.topics_tree_widget.sortByColumn(
+            self._column_names.index('_msg_order'), Qt.AscendingOrder)
+        self.topics_tree_widget.setColumnHidden(self._column_index['_msg_order'], True)
+
+        header = self.topics_tree_widget.header()
+        try:
+            setSectionResizeMode = header.setSectionResizeMode  # Qt5
+        except AttributeError:
+            setSectionResizeMode = header.setResizeMode  # Qt4
+        setSectionResizeMode(QHeaderView.ResizeToContents)
+
+        # Give policy columns fixed widths so embedded widgets are always visible
+        policy_cols = ['reliability', 'history', 'durability', 'depth']
+        policy_widths = [100, 90, 120, 55]
+        for col, width in zip(policy_cols, policy_widths):
+            setSectionResizeMode(self._column_index[col], QHeaderView.Interactive)
+            self.topics_tree_widget.setColumnWidth(self._column_index[col], width)
+
+        header.customContextMenuRequested.connect(
+            self.handle_header_view_customContextMenuRequested)
+        header.setContextMenuPolicy(Qt.CustomContextMenu)
 
     def set_topic_specifier(self, specifier):
         self._select_topic_type = specifier
@@ -176,6 +204,7 @@ class TopicWidget(QWidget):
                 # add it to the dict and tree view
                 topic_item = self._recursive_create_widget_items(
                     self.topics_tree_widget, topic_name, topic_types, message_instance)
+                topic_info.set_qos_profile(self._build_qos_profile_from_ui(topic_name))
                 new_topics[topic_name] = {
                     'item': topic_item,
                     'info': topic_info,
@@ -233,15 +262,6 @@ class TopicWidget(QWidget):
                 # update bandwidth
                 # TODO (brawner) Currently unsupported
                 bandwidth_text = 'unknown'
-                # bytes_per_s, _, _, _ = topic_info.get_bw()
-                # if bytes_per_s is None:
-                #     bandwidth_text = 'unknown'
-                # elif bytes_per_s < 1000:
-                #     bandwidth_text = '%.2fB/s' % bytes_per_s
-                # elif bytes_per_s < 1000000:
-                #     bandwidth_text = '%.2fKB/s' % (bytes_per_s / 1000.)
-                # else:
-                #     bandwidth_text = '%.2fMB/s' % (bytes_per_s / 1000000.)
 
                 # update values
                 value_text = ''
@@ -249,13 +269,10 @@ class TopicWidget(QWidget):
 
             else:
                 rate_text = ''
-                # bytes_per_s = None
                 bandwidth_text = ''
                 value_text = 'not monitored' if topic_info.error is None else topic_info.error
 
             self._tree_items[topic_info._topic_name].setText(self._column_index['rate'], rate_text)
-            # self._tree_items[topic_info._topic_name].setData(
-            #    self._column_index['bandwidth'], Qt.UserRole, bytes_per_s)
             self._tree_items[topic_info._topic_name].setText(
                 self._column_index['bandwidth'], bandwidth_text)
             self._tree_items[topic_info._topic_name].setText(
@@ -313,6 +330,7 @@ class TopicWidget(QWidget):
             # show full topic name with preceding namespace on toplevel item
             topic_text = topic_name
             item = TreeWidgetItem(self._toggle_monitoring, topic_name, parent)
+            self._create_qos_policy_widgets(topic_name, item)
         else:
             topic_text = topic_name.split('/')[-1]
             if '[' in topic_text:
@@ -342,6 +360,87 @@ class TopicWidget(QWidget):
                         item, topic_name + '[%d]' % index, base_type_str, base_instance)
                     i.setText(self._column_index['_msg_order'], str(index))
         return item
+
+    def _create_qos_policy_widgets(self, topic_name, item):
+        # Reliability
+        reliability_combo = QComboBox(self.topics_tree_widget)
+        reliability_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        reliability_combo.addItem('Reliable', ReliabilityPolicy.RELIABLE)
+        reliability_combo.addItem('Best Effort', ReliabilityPolicy.BEST_EFFORT)
+        reliability_combo.setCurrentIndex(0)
+        reliability_combo.currentIndexChanged.connect(
+            lambda _, topic_name=topic_name: self._on_qos_policy_changed(topic_name))
+        self.topics_tree_widget.setItemWidget(
+            item, self._column_index['reliability'], reliability_combo)
+
+        # History
+        history_combo = QComboBox(self.topics_tree_widget)
+        history_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        history_combo.addItem('Keep Last', HistoryPolicy.KEEP_LAST)
+        history_combo.addItem('Keep All', HistoryPolicy.KEEP_ALL)
+        history_combo.setCurrentIndex(0)
+        history_combo.currentIndexChanged.connect(
+            lambda _, topic_name=topic_name: self._on_qos_policy_changed(topic_name))
+        self.topics_tree_widget.setItemWidget(
+            item, self._column_index['history'], history_combo)
+
+        # Durability
+        durability_combo = QComboBox(self.topics_tree_widget)
+        durability_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        durability_combo.addItem('Volatile', DurabilityPolicy.VOLATILE)
+        durability_combo.addItem('Transient Local', DurabilityPolicy.TRANSIENT_LOCAL)
+        durability_combo.setCurrentIndex(0)
+        durability_combo.currentIndexChanged.connect(
+            lambda _, topic_name=topic_name: self._on_qos_policy_changed(topic_name))
+        self.topics_tree_widget.setItemWidget(
+            item, self._column_index['durability'], durability_combo)
+
+        # Depth
+        depth_spin = QSpinBox(self.topics_tree_widget)
+        depth_spin.setRange(1, 1000)
+        depth_spin.setValue(10)
+        depth_spin.valueChanged.connect(
+            lambda _, topic_name=topic_name: self._on_qos_policy_changed(topic_name))
+        self.topics_tree_widget.setItemWidget(
+            item, self._column_index['depth'], depth_spin)
+
+    def _build_qos_profile_from_ui(self, topic_name):
+        item = self._tree_items.get(topic_name)
+        if item is None:
+            return QoSProfile(depth=10)
+
+        reliability_combo = self.topics_tree_widget.itemWidget(
+            item, self._column_index['reliability'])
+        history_combo = self.topics_tree_widget.itemWidget(
+            item, self._column_index['history'])
+        durability_combo = self.topics_tree_widget.itemWidget(
+            item, self._column_index['durability'])
+        depth_spin = self.topics_tree_widget.itemWidget(
+            item, self._column_index['depth'])
+
+        reliability = (
+            reliability_combo.currentData()
+            if reliability_combo else ReliabilityPolicy.RELIABLE)
+        history = (
+            history_combo.currentData()
+            if history_combo else HistoryPolicy.KEEP_LAST)
+        durability = (
+            durability_combo.currentData()
+            if durability_combo else DurabilityPolicy.VOLATILE)
+        depth = depth_spin.value() if depth_spin else 10
+
+        return QoSProfile(
+            reliability=reliability,
+            history=history,
+            durability=durability,
+            depth=depth,
+        )
+
+    def _on_qos_policy_changed(self, topic_name):
+        if topic_name not in self._topics:
+            return
+        profile = self._build_qos_profile_from_ui(topic_name)
+        self._topics[topic_name]['info'].set_qos_profile(profile)
 
     def _toggle_monitoring(self, topic_name):
         item = self._tree_items[topic_name]
@@ -432,7 +531,12 @@ class TopicWidget(QWidget):
     def restore_settings(self, pluggin_settings, instance_settings):
         if instance_settings.contains('tree_widget_header_state'):
             header_state = instance_settings.value('tree_widget_header_state')
-            if not self.topics_tree_widget.header().restoreState(header_state):
+            if self.topics_tree_widget.header().restoreState(header_state):
+                if self.topics_tree_widget.columnCount() != len(self._column_names):
+                    self._logger.warn(
+                        'rqt_topic: Restored header state has stale column count, reinitializing.')
+                    self._init_tree_columns()
+            else:
                 self._logger.warn('rqt_topic: Failed to restore header state.')
 
 
