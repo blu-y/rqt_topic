@@ -8,6 +8,7 @@
 ## 변경 사항
 
 - 각 토픽 행에 `Reliability`, `History`, `Durability`, `Depth` 설정을 추가했습니다.
+- 새 토픽이 표시될 때 첫 publisher의 QoS profile을 기본 선택값으로 사용합니다.
 - 토픽을 이미 체크해서 구독 중인 상태에서도 QoS 설정을 바꾸면 subscription을 다시 생성합니다.
 - UI에서 선택한 QoS profile을 subscription에 직접 사용합니다.
 - 잘못된 QoS로 한 번 구독 실패한 뒤에도, 올바른 QoS로 바꾸고 다시 구독할 수 있습니다.

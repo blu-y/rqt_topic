@@ -95,6 +95,8 @@ class TopicWidget(QWidget):
 
         self._topics = {}
         self._tree_items = {}
+        self._qos_overridden_topics = set()
+        self._updating_qos_widgets = set()
         self._column_index = {}
         for column_name in self._column_names:
             self._column_index[column_name] = len(self._column_index)
@@ -202,9 +204,15 @@ class TopicWidget(QWidget):
                 if topic_info.message_class is not None:
                     message_instance = topic_info.message_class()
                 # add it to the dict and tree view
+                publisher_qos_profile = self._get_publisher_qos_profile(topic_name)
                 topic_item = self._recursive_create_widget_items(
-                    self.topics_tree_widget, topic_name, topic_types, message_instance)
-                topic_info.set_qos_profile(self._build_qos_profile_from_ui(topic_name))
+                    self.topics_tree_widget, topic_name, topic_types, message_instance,
+                    publisher_qos_profile=publisher_qos_profile)
+                if publisher_qos_profile is not None:
+                    topic_info.set_qos_profile(
+                        self._build_qos_profile_from_publisher(publisher_qos_profile))
+                else:
+                    topic_info.set_qos_profile(self._build_qos_profile_from_ui(topic_name))
                 new_topics[topic_name] = {
                     'item': topic_item,
                     'info': topic_info,
@@ -223,12 +231,15 @@ class TopicWidget(QWidget):
                     topic_is_active = True
 
                 if topic_is_active:
+                    self._sync_topic_qos_from_publisher(topic_name)
                     new_topics[topic_name] = self._topics[topic_name]
                     del self._topics[topic_name]
 
         # clean up old topics
         for topic_name in list(self._topics.keys()):
             self._topics[topic_name]['info'].stop_monitoring()
+            self._qos_overridden_topics.discard(topic_name)
+            self._updating_qos_widgets.discard(topic_name)
             index = self.topics_tree_widget.indexOfTopLevelItem(
                 self._topics[topic_name]['item'])
             self.topics_tree_widget.takeTopLevelItem(index)
@@ -325,12 +336,13 @@ class TopicWidget(QWidget):
 
         return type_str, array_size
 
-    def _recursive_create_widget_items(self, parent, topic_name, type_names, message):
+    def _recursive_create_widget_items(
+            self, parent, topic_name, type_names, message, publisher_qos_profile=None):
         if parent is self.topics_tree_widget:
             # show full topic name with preceding namespace on toplevel item
             topic_text = topic_name
             item = TreeWidgetItem(self._toggle_monitoring, topic_name, parent)
-            self._create_qos_policy_widgets(topic_name, item)
+            self._create_qos_policy_widgets(topic_name, item, publisher_qos_profile)
         else:
             topic_text = topic_name.split('/')[-1]
             if '[' in topic_text:
@@ -361,13 +373,28 @@ class TopicWidget(QWidget):
                     i.setText(self._column_index['_msg_order'], str(index))
         return item
 
-    def _create_qos_policy_widgets(self, topic_name, item):
+    def _get_publisher_qos_profile(self, topic_name):
+        try:
+            publishers_info = self._node.get_publishers_info_by_topic(topic_name)
+        except Exception as e:
+            qWarning('rqt_topic: Failed to get publisher QoS for "%s": %s' %
+                     (topic_name, e))
+            return None
+
+        if len(publishers_info) == 0:
+            return None
+
+        return publishers_info[0].qos_profile
+
+    def _create_qos_policy_widgets(self, topic_name, item, publisher_qos_profile=None):
         # Reliability
         reliability_combo = QComboBox(self.topics_tree_widget)
         reliability_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         reliability_combo.addItem('Reliable', ReliabilityPolicy.RELIABLE)
         reliability_combo.addItem('Best Effort', ReliabilityPolicy.BEST_EFFORT)
-        reliability_combo.setCurrentIndex(0)
+        self._set_combo_current_data(
+            reliability_combo,
+            self._qos_policy_value(publisher_qos_profile, 'reliability'))
         reliability_combo.currentIndexChanged.connect(
             lambda _, topic_name=topic_name: self._on_qos_policy_changed(topic_name))
         self.topics_tree_widget.setItemWidget(
@@ -378,7 +405,9 @@ class TopicWidget(QWidget):
         history_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         history_combo.addItem('Keep Last', HistoryPolicy.KEEP_LAST)
         history_combo.addItem('Keep All', HistoryPolicy.KEEP_ALL)
-        history_combo.setCurrentIndex(0)
+        self._set_combo_current_data(
+            history_combo,
+            self._qos_policy_value(publisher_qos_profile, 'history'))
         history_combo.currentIndexChanged.connect(
             lambda _, topic_name=topic_name: self._on_qos_policy_changed(topic_name))
         self.topics_tree_widget.setItemWidget(
@@ -389,7 +418,9 @@ class TopicWidget(QWidget):
         durability_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         durability_combo.addItem('Volatile', DurabilityPolicy.VOLATILE)
         durability_combo.addItem('Transient Local', DurabilityPolicy.TRANSIENT_LOCAL)
-        durability_combo.setCurrentIndex(0)
+        self._set_combo_current_data(
+            durability_combo,
+            self._qos_policy_value(publisher_qos_profile, 'durability'))
         durability_combo.currentIndexChanged.connect(
             lambda _, topic_name=topic_name: self._on_qos_policy_changed(topic_name))
         self.topics_tree_widget.setItemWidget(
@@ -398,11 +429,130 @@ class TopicWidget(QWidget):
         # Depth
         depth_spin = QSpinBox(self.topics_tree_widget)
         depth_spin.setRange(1, 1000)
-        depth_spin.setValue(10)
+        depth_spin.setValue(self._qos_depth_value(publisher_qos_profile))
         depth_spin.valueChanged.connect(
             lambda _, topic_name=topic_name: self._on_qos_policy_changed(topic_name))
         self.topics_tree_widget.setItemWidget(
             item, self._column_index['depth'], depth_spin)
+
+    def _set_combo_current_data(self, combo, value):
+        if value is None:
+            combo.setCurrentIndex(0)
+            return
+
+        value_key = self._qos_policy_key(value)
+        for index in range(combo.count()):
+            if self._qos_policy_key(combo.itemData(index)) == value_key:
+                combo.setCurrentIndex(index)
+                return
+        combo.setCurrentIndex(0)
+
+    def _qos_policy_key(self, value):
+        return getattr(value, 'value', value)
+
+    def _qos_policy_is_one_of(self, value, allowed_values):
+        value_key = self._qos_policy_key(value)
+        return any(self._qos_policy_key(allowed_value) == value_key
+                   for allowed_value in allowed_values)
+
+    def _qos_profiles_match(self, left, right):
+        if left is None or right is None:
+            return left is right
+
+        return (
+            self._qos_policy_key(left.reliability) == self._qos_policy_key(right.reliability) and
+            self._qos_policy_key(left.history) == self._qos_policy_key(right.history) and
+            self._qos_policy_key(left.durability) == self._qos_policy_key(right.durability) and
+            left.depth == right.depth)
+
+    def _qos_policy_value(self, qos_profile, policy_name):
+        if qos_profile is None:
+            return None
+        return getattr(qos_profile, policy_name, None)
+
+    def _qos_depth_value(self, qos_profile):
+        depth = getattr(qos_profile, 'depth', 10)
+        if depth is None or depth < 1:
+            return 10
+        return min(depth, 1000)
+
+    def _qos_reliability_value(self, qos_profile):
+        reliability = self._qos_policy_value(qos_profile, 'reliability')
+        if self._qos_policy_is_one_of(
+                reliability, [ReliabilityPolicy.RELIABLE, ReliabilityPolicy.BEST_EFFORT]):
+            return reliability
+        return ReliabilityPolicy.RELIABLE
+
+    def _qos_history_value(self, qos_profile):
+        history = self._qos_policy_value(qos_profile, 'history')
+        if self._qos_policy_is_one_of(
+                history, [HistoryPolicy.KEEP_LAST, HistoryPolicy.KEEP_ALL]):
+            return history
+        return HistoryPolicy.KEEP_LAST
+
+    def _qos_durability_value(self, qos_profile):
+        durability = self._qos_policy_value(qos_profile, 'durability')
+        if self._qos_policy_is_one_of(
+                durability, [DurabilityPolicy.VOLATILE, DurabilityPolicy.TRANSIENT_LOCAL]):
+            return durability
+        return DurabilityPolicy.VOLATILE
+
+    def _build_qos_profile_from_publisher(self, publisher_qos_profile):
+        return QoSProfile(
+            reliability=self._qos_reliability_value(publisher_qos_profile),
+            history=self._qos_history_value(publisher_qos_profile),
+            durability=self._qos_durability_value(publisher_qos_profile),
+            depth=self._qos_depth_value(publisher_qos_profile),
+        )
+
+    def _apply_qos_profile_to_widgets(self, topic_name, qos_profile):
+        item = self._tree_items.get(topic_name)
+        if item is None or qos_profile is None:
+            return
+
+        reliability_combo = self.topics_tree_widget.itemWidget(
+            item, self._column_index['reliability'])
+        history_combo = self.topics_tree_widget.itemWidget(
+            item, self._column_index['history'])
+        durability_combo = self.topics_tree_widget.itemWidget(
+            item, self._column_index['durability'])
+        depth_spin = self.topics_tree_widget.itemWidget(
+            item, self._column_index['depth'])
+
+        self._updating_qos_widgets.add(topic_name)
+        try:
+            if reliability_combo:
+                self._set_combo_current_data(
+                    reliability_combo,
+                    self._qos_reliability_value(qos_profile))
+            if history_combo:
+                self._set_combo_current_data(
+                    history_combo,
+                    self._qos_history_value(qos_profile))
+            if durability_combo:
+                self._set_combo_current_data(
+                    durability_combo,
+                    self._qos_durability_value(qos_profile))
+            if depth_spin:
+                depth_spin.setValue(self._qos_depth_value(qos_profile))
+        finally:
+            self._updating_qos_widgets.discard(topic_name)
+
+    def _sync_topic_qos_from_publisher(self, topic_name):
+        if topic_name in self._qos_overridden_topics:
+            return
+        if topic_name not in self._topics:
+            return
+
+        publisher_qos_profile = self._get_publisher_qos_profile(topic_name)
+        if publisher_qos_profile is None:
+            return
+
+        self._apply_qos_profile_to_widgets(topic_name, publisher_qos_profile)
+        subscription_qos_profile = self._build_qos_profile_from_publisher(publisher_qos_profile)
+        topic_info = self._topics[topic_name]['info']
+        if not self._qos_profiles_match(topic_info._qos_profile, subscription_qos_profile):
+            topic_info.set_qos_profile(subscription_qos_profile)
 
     def _build_qos_profile_from_ui(self, topic_name):
         item = self._tree_items.get(topic_name)
@@ -439,12 +589,15 @@ class TopicWidget(QWidget):
     def _on_qos_policy_changed(self, topic_name):
         if topic_name not in self._topics:
             return
+        if topic_name not in self._updating_qos_widgets:
+            self._qos_overridden_topics.add(topic_name)
         profile = self._build_qos_profile_from_ui(topic_name)
         self._topics[topic_name]['info'].set_qos_profile(profile)
 
     def _toggle_monitoring(self, topic_name):
         item = self._tree_items[topic_name]
         if item.checkState(0):
+            self._sync_topic_qos_from_publisher(topic_name)
             self._topics[topic_name]['info'].start_monitoring()
         else:
             self._topics[topic_name]['info'].stop_monitoring()
